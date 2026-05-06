@@ -1,4 +1,6 @@
 import datetime as dt
+import os
+import re
 from dataclasses import dataclass
 from typing import List, Dict
 from urllib.parse import urljoin
@@ -12,23 +14,7 @@ except ModuleNotFoundError:
     print("필요한 패키지가 설치되지 않았습니다. 먼저 pip install -r requirements.txt를 실행하세요.")
     raise
 
-SOURCES = [
-    {
-        "name": "ESG Today",
-        "url": "https://www.esgtoday.com/",
-        "rss_urls": ["https://www.esgtoday.com/feed/"],
-    },
-    {
-        "name": "Carbon Herald",
-        "url": "https://carbonherald.com/",
-        "rss_urls": ["https://carbonherald.com/feed/"],
-    },
-    {
-        "name": "The EV Report",
-        "url": "https://theevreport.com/",
-        "rss_urls": ["https://theevreport.com/feed/"],
-    },
-]
+MEDIA_MASTER_FILE = "media_master.xlsx"
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -39,36 +25,39 @@ BROWSER_HEADERS = {
 }
 
 INDUSTRY_RULES: Dict[str, List[str]] = {
-    "자동차": ["ev", "electric vehicle", "automotive", "car", "tesla", "hyundai", "kia", "ford", "gm", "toyota"],
+    "탄소제거·CCUS": ["carbon capture", "ccs", "ccus", "carbon removal", "direct air capture", "dac", "geological storage", "captured co2", "co2", "biochar", "enhanced rock weathering", "carbon management"],
+    "탄소시장": ["carbon credits", "carbon credit", "registry", "offset", "ets", "carbon market"],
+    "항공": ["aviation", "airline", "aircraft", "boeing", "saf", "esaf"],
+    "자동차": ["automotive", "electric vehicle", "ev", "tesla", "hyundai", "kia", "ford", "gm", "toyota"],
     "철강": ["steel", "posco", "arcelormittal"],
     "조선": ["ship", "shipping", "shipbuilding", "vessel"],
     "IT": ["software", "cloud", "ai", "microsoft", "google", "amazon", "apple"],
     "반도체": ["semiconductor", "chip", "tsmc", "nvidia", "intel", "memory"],
     "식음료": ["food", "beverage", "coca-cola", "nestle", "drink"],
-    "기후테크·순환경제": ["recycling", "circular", "climate tech", "capture", "ccus", "waste"],
+    "기후테크·순환경제": ["recycling", "circular", "climate tech", "waste"],
     "재생에너지": ["renewable", "solar", "wind", "hydrogen", "clean energy"],
     "배터리": ["battery", "lithium", "cathode", "anode"],
     "석유화학": ["oil", "gas", "petrochemical", "refinery", "lng"],
 }
 
 ISSUE_RULES: Dict[str, List[str]] = {
+    "투자": ["raises", "funding", "capital raise", "investment", "invest", "financing"],
+    "ESG DEAL": ["partnership", "partner", "supplier deal", "sustainability-linked", "slb", "ppa"],
+    "테크": ["launches", "breakthrough", "technology", "tech", "ai", "software"],
+    "규제": ["authorization", "standard contract", "regulation", "rule", "compliance", "standard"],
+    "탄소시장": ["carbon credits", "registry", "offset", "ets", "carbon market"],
     "정책": ["policy", "plan", "roadmap", "initiative"],
-    "규제": ["regulation", "rule", "compliance", "ban", "standard"],
     "공시": ["disclosure", "reporting", "filing", "scope 3"],
     "소송": ["lawsuit", "sue", "court", "litigation", "settlement"],
-    "투자": ["invest", "investment", "funding", "financing", "raises"],
     "M&A": ["acquire", "acquisition", "merger", "buyout", "deal"],
-    "테크": ["technology", "tech", "platform", "ai", "software"],
     "공급망": ["supply chain", "supplier", "procurement", "sourcing"],
     "평가·등급": ["rating", "score", "rank", "assessment", "benchmark"],
-    "탄소시장": ["carbon market", "carbon credit", "offset", "ets"],
     "금융": ["bank", "loan", "bond", "asset manager", "finance"],
     "그린워싱": ["greenwashing", "misleading", "false claim"],
     "노동·인권": ["labor", "human rights", "worker", "wage"],
     "생물다양성": ["biodiversity", "nature", "forest", "deforestation"],
     "리스크": ["risk", "exposure", "uncertainty"],
     "실적·전략": ["earnings", "guidance", "strategy", "target", "outlook"],
-    "ESG DEAL": ["esg deal", "sustainability-linked", "slb", "ppa"],
 }
 
 
@@ -77,6 +66,38 @@ class Article:
     source: str
     title: str
     link: str
+
+
+def keyword_match(text: str, keyword: str) -> bool:
+    pattern = r"\b" + re.escape(keyword.lower()) + r"\b"
+    return re.search(pattern, text.lower()) is not None
+
+
+def classify_industry(title: str, default_tag: str = "기타") -> str:
+    for tag, keywords in INDUSTRY_RULES.items():
+        if any(keyword_match(title, k) for k in keywords):
+            return tag
+    return default_tag
+
+
+def classify_issues(title: str, default_tag: str = "기타", max_tags: int = 2) -> str:
+    matches = []
+    for tag, keywords in ISSUE_RULES.items():
+        if any(keyword_match(title, k) for k in keywords):
+            matches.append(tag)
+        if len(matches) >= max_tags:
+            break
+    return ", ".join(matches) if matches else default_tag
+
+
+def load_sources_from_master(path: str = MEDIA_MASTER_FILE) -> List[Dict[str, str]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} 파일이 없습니다.")
+
+    df = pd.read_excel(path)
+    df = df.fillna("")
+    active = df[df["사용여부"].astype(str).str.upper() == "Y"]
+    return active.to_dict(orient="records")
 
 
 def get_html(url: str) -> str:
@@ -104,8 +125,9 @@ def find_rss_links(site_url: str) -> List[str]:
     return list(dict.fromkeys(links))
 
 
-def collect_from_rss(source_name: str, site_url: str, preset_rss_urls: List[str], limit: int = 30) -> List[Article]:
-    candidate_feeds = list(dict.fromkeys(preset_rss_urls + find_rss_links(site_url)))
+def collect_from_rss(source_name: str, site_url: str, rss_url: str, limit: int = 30) -> List[Article]:
+    preset = [rss_url] if str(rss_url).strip() else []
+    candidate_feeds = list(dict.fromkeys(preset + find_rss_links(site_url)))
 
     for feed_url in candidate_feeds:
         try:
@@ -136,7 +158,6 @@ def collect_from_html(source_name: str, site_url: str, limit: int = 30) -> List[
     for a in soup.select("article a[href], h2 a[href], h3 a[href], .post a[href]"):
         title = a.get_text(" ", strip=True)
         link = urljoin(site_url, a.get("href", ""))
-
         if not title or len(title) < 8:
             continue
         if not link.startswith("http"):
@@ -149,26 +170,27 @@ def collect_from_html(source_name: str, site_url: str, limit: int = 30) -> List[
     return list(unique.values())[:limit]
 
 
-def classify(title: str, rules: Dict[str, List[str]], default_tag: str = "기타") -> str:
-    t = title.lower()
-    for tag, keywords in rules.items():
-        if any(k in t for k in keywords):
-            return tag
-    return default_tag
-
-
 def collect_all() -> List[Dict[str, str]]:
     today = dt.date.today().isoformat()
     rows = []
     seen_urls = set()
     failed_sources = []
 
-    for src in SOURCES:
-        source_name = src["name"]
-        site_url = src["url"]
-        rss_urls = src.get("rss_urls", [])
+    sources = load_sources_from_master()
 
-        items = collect_from_rss(source_name, site_url, rss_urls)
+    for src in sources:
+        source_name = str(src.get("매체명", "")).strip()
+        site_url = str(src.get("URL", "")).strip()
+        rss_url = str(src.get("RSS_URL", "")).strip()
+        login_required = str(src.get("로그인필요", "")).strip().upper() == "Y"
+        default_industry = str(src.get("기본산업태그", "")).strip() or "기타"
+        default_issue = str(src.get("기본이슈태그", "")).strip() or "기타"
+
+        if login_required:
+            print(f"[스킵] {source_name}: 로그인 필요")
+            continue
+
+        items = collect_from_rss(source_name, site_url, rss_url)
         method = "RSS"
 
         if not items:
@@ -191,14 +213,15 @@ def collect_all() -> List[Dict[str, str]]:
                 continue
             seen_urls.add(item.link)
             added_count += 1
+
             rows.append(
                 {
                     "날짜": today,
                     "매체명": item.source,
                     "기사명": item.title,
                     "링크": item.link,
-                    "산업태그": classify(item.title, INDUSTRY_RULES),
-                    "이슈태그": classify(item.title, ISSUE_RULES),
+                    "산업태그": classify_industry(item.title, default_tag=default_industry),
+                    "이슈태그": classify_issues(item.title, default_tag=default_issue, max_tags=2),
                     "담당자": "",
                     "비고": "",
                 }
@@ -218,11 +241,24 @@ def collect_all() -> List[Dict[str, str]]:
 
 def save_excel(rows: List[Dict[str, str]]) -> str:
     date_str = dt.date.today().strftime("%Y%m%d")
-    filename = f"mawari_{date_str}.xlsx"
+    base_name = f"mawari_{date_str}"
     columns = ["날짜", "매체명", "기사명", "링크", "산업태그", "이슈태그", "담당자", "비고"]
     df = pd.DataFrame(rows, columns=columns)
-    df.to_excel(filename, index=False)
-    return filename
+
+    index = 0
+    while True:
+        filename = f"{base_name}.xlsx" if index == 0 else f"{base_name}_{index}.xlsx"
+        if os.path.exists(filename):
+            index += 1
+            continue
+        try:
+            df.to_excel(filename, index=False)
+            if index > 0:
+                print("기존 엑셀 파일이 열려 있거나 같은 이름 파일이 있어 새 파일명으로 저장했습니다.")
+            return filename
+        except PermissionError:
+            index += 1
+            continue
 
 
 if __name__ == "__main__":
