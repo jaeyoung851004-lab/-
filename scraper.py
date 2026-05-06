@@ -1,6 +1,6 @@
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from urllib.parse import urljoin
 
 try:
@@ -13,18 +13,30 @@ except ModuleNotFoundError:
     raise
 
 SOURCES = [
-    {"name": "ESG Today", "url": "https://www.esgtoday.com/"},
-    {"name": "Carbon Herald", "url": "https://carbonherald.com/"},
-    {"name": "The EV Report", "url": "https://theevreport.com/"},
+    {
+        "name": "ESG Today",
+        "url": "https://www.esgtoday.com/",
+        "rss_urls": ["https://www.esgtoday.com/feed/"],
+    },
+    {
+        "name": "Carbon Herald",
+        "url": "https://carbonherald.com/",
+        "rss_urls": ["https://carbonherald.com/feed/"],
+    },
+    {
+        "name": "The EV Report",
+        "url": "https://theevreport.com/",
+        "rss_urls": ["https://theevreport.com/feed/"],
+    },
 ]
 
-INDUSTRY_TAGS = [
-    "자동차", "철강", "조선", "IT", "반도체", "식음료", "기후테크·순환경제", "재생에너지", "배터리", "석유화학", "기타",
-]
-
-ISSUE_TAGS = [
-    "정책", "규제", "공시", "소송", "투자", "M&A", "테크", "공급망", "평가·등급", "탄소시장", "금융", "그린워싱", "노동·인권", "생물다양성", "리스크", "실적·전략", "ESG DEAL", "기타",
-]
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
 
 INDUSTRY_RULES: Dict[str, List[str]] = {
     "자동차": ["ev", "electric vehicle", "automotive", "car", "tesla", "hyundai", "kia", "ford", "gm", "toyota"],
@@ -68,8 +80,7 @@ class Article:
 
 
 def get_html(url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, timeout=15, headers=headers)
+    r = requests.get(url, timeout=15, headers=BROWSER_HEADERS)
     r.raise_for_status()
     return r.text
 
@@ -90,24 +101,30 @@ def find_rss_links(site_url: str) -> List[str]:
         href = a["href"]
         if "rss" in href.lower() or "feed" in href.lower():
             links.append(urljoin(site_url, href))
-
-    # 중복 제거
     return list(dict.fromkeys(links))
 
 
-def collect_from_rss(source_name: str, site_url: str, limit: int = 30) -> List[Article]:
-    for feed_url in find_rss_links(site_url):
-        feed = feedparser.parse(feed_url)
-        if feed.entries:
+def collect_from_rss(source_name: str, site_url: str, preset_rss_urls: List[str], limit: int = 30) -> List[Article]:
+    candidate_feeds = list(dict.fromkeys(preset_rss_urls + find_rss_links(site_url)))
+
+    for feed_url in candidate_feeds:
+        try:
+            feed = feedparser.parse(feed_url, request_headers=BROWSER_HEADERS)
+            entries = getattr(feed, "entries", [])
+            if not entries:
+                continue
+
             items = []
-            for entry in feed.entries[:limit]:
+            for entry in entries[:limit]:
                 title = getattr(entry, "title", "").strip()
                 link = getattr(entry, "link", "").strip()
                 if title and link:
                     items.append(Article(source_name, title, link))
             if items:
-                print(f"[RSS 성공] {source_name}: {feed_url}")
+                print(f"[RSS 성공] {source_name}: {feed_url} ({len(items)}건)")
                 return items
+        except Exception as e:
+            print(f"[RSS 실패] {source_name}: {feed_url} ({e})")
     return []
 
 
@@ -126,7 +143,6 @@ def collect_from_html(source_name: str, site_url: str, limit: int = 30) -> List[
             continue
         articles.append(Article(source_name, title, link))
 
-    # 링크 기준으로 중복 제거 + 개수 제한
     unique = {}
     for item in articles:
         unique[item.link] = item
@@ -145,25 +161,36 @@ def collect_all() -> List[Dict[str, str]]:
     today = dt.date.today().isoformat()
     rows = []
     seen_urls = set()
+    failed_sources = []
 
     for src in SOURCES:
         source_name = src["name"]
         site_url = src["url"]
+        rss_urls = src.get("rss_urls", [])
 
-        items = collect_from_rss(source_name, site_url)
+        items = collect_from_rss(source_name, site_url, rss_urls)
+        method = "RSS"
+
         if not items:
-            print(f"[RSS 실패 -> HTML] {source_name}")
+            print(f"[RSS 실패 -> HTML 시도] {source_name}")
+            method = "HTML"
             try:
                 items = collect_from_html(source_name, site_url)
             except Exception as e:
                 print(f"[수집 실패] {source_name}: {e}")
                 items = []
 
+        if not items:
+            failed_sources.append(source_name)
+            print(f"[완전 실패] {source_name}: 0건")
+            continue
+
+        added_count = 0
         for item in items:
             if item.link in seen_urls:
                 continue
             seen_urls.add(item.link)
-
+            added_count += 1
             rows.append(
                 {
                     "날짜": today,
@@ -176,6 +203,16 @@ def collect_all() -> List[Dict[str, str]]:
                     "비고": "",
                 }
             )
+
+        print(f"[수집 완료] {source_name}: {added_count}건 (방법: {method})")
+
+    print("\n===== 수집 요약 =====")
+    print(f"성공 기사 총 {len(rows)}건")
+    if failed_sources:
+        print("실패 매체: " + ", ".join(failed_sources))
+    else:
+        print("실패 매체: 없음")
+
     return rows
 
 
@@ -183,7 +220,6 @@ def save_excel(rows: List[Dict[str, str]]) -> str:
     date_str = dt.date.today().strftime("%Y%m%d")
     filename = f"mawari_{date_str}.xlsx"
     columns = ["날짜", "매체명", "기사명", "링크", "산업태그", "이슈태그", "담당자", "비고"]
-
     df = pd.DataFrame(rows, columns=columns)
     df.to_excel(filename, index=False)
     return filename
